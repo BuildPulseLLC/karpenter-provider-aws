@@ -138,6 +138,73 @@ var _ = Describe("InstanceProvider", func() {
 		Expect(instance).To(BeNil())
 	})
 	It("should return all NodePool-owned instances from List", func() {
+	It("should start an instance from warm pool when available", func() {
+		nodeClass.Spec.WarmPool = &v1.WarmPoolConfig{
+			AutoScalingGroupName: "test-asg",
+		}
+		ExpectApplied(ctx, env.Client, nodeClaim, nodePool, nodeClass)
+		nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+		// Create a stopped instance in the warm pool
+		instanceID := fake.InstanceID()
+		awsEnv.EC2API.Instances.Store(
+			instanceID,
+			ec2types.Instance{
+				State: &ec2types.InstanceState{
+					Name: ec2types.InstanceStateNameStopped,
+				},
+				Tags: []ec2types.Tag{
+					{
+						Key:   aws.String("aws:autoscaling:groupName"),
+						Value: aws.String("test-asg"),
+					},
+					{
+						Key:   aws.String("aws:autoscaling:warmPool"),
+						Value: aws.String("true"),
+					},
+				},
+				InstanceId:   aws.String(instanceID),
+				InstanceType: "m5.large",
+				Placement: &ec2types.Placement{
+					AvailabilityZone: aws.String("test-zone-1a"),
+				},
+			},
+		)
+
+		instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+		Expect(err).ToNot(HaveOccurred())
+
+		instance, err := awsEnv.InstanceProvider.Create(ctx, nodeClass, nodeClaim, nil, instanceTypes)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(instance.ID).To(Equal(instanceID))
+	})
+	It("should fall back to standard provisioning when warm pool empty", func() {
+		nodeClass.Spec.WarmPool = &v1.WarmPoolConfig{
+			AutoScalingGroupName: "test-asg",
+		}
+		ExpectApplied(ctx, env.Client, nodeClaim, nodePool, nodeClass)
+		nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+		instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+		Expect(err).ToNot(HaveOccurred())
+
+		instance, err := awsEnv.InstanceProvider.Create(ctx, nodeClass, nodeClaim, nil, instanceTypes)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(instance).ToNot(BeNil())
+		// Should not be from warm pool
+		Expect(instance.Tags).ToNot(HaveKey("aws:autoscaling:warmPool"))
+	})
+	It("should handle errors when starting warm pool instance", func() {
+		nodeClass.Spec.WarmPool = &v1.WarmPoolConfig{
+			AutoScalingGroupName: "test-asg",
+		}
+		ExpectApplied(ctx, env.Client, nodeClaim, nodePool, nodeClass)
+		nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+
+		awsEnv.EC2API.NextError.Set(fmt.Errorf("StartInstances error"))
+		_, err := awsEnv.InstanceProvider.Create(ctx, nodeClass, nodeClaim, nil, nil)
+		Expect(err).To(MatchError(ContainSubstring("StartInstances error")))
+	})
 		ids := sets.New[string]()
 		// Provision instances that have the karpenter.sh/nodepool key
 		for i := 0; i < 20; i++ {

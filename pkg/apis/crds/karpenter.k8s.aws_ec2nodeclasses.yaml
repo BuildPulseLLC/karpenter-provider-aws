@@ -359,6 +359,29 @@ spec:
                         type: string
                         pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       description: SystemReserved contains resources reserved for OS system daemons and kernel memory.
+                warmPool:
+                  description: WarmPool configures the use of a warm pool of stopped instances from an Auto Scaling group
+                  properties:
+                    autoScalingGroupName:
+                      description: |-
+                        AutoScalingGroupName is the name of the Auto Scaling group containing the warm pool.
+                        The ASG must be configured with a warm pool that maintains stopped instances.
+                      type: string
+                      x-kubernetes-validations:
+                        - message: autoScalingGroupName cannot be empty
+                          rule: self != ''
+                    minSize:
+                      description: |-
+                        MinSize is the minimum number of stopped instances to maintain in the warm pool.
+                        If not specified, the ASG's warm pool configuration will be used.
+                      format: int32
+                      minimum: 0
+                      type: integer
+                  required:
+                    - autoScalingGroupName
+                  type: object
+                userData:
+                  description: |-
                       type: object
                       x-kubernetes-validations:
                         - message: valid keys for systemReserved are ['cpu','memory','ephemeral-storage','pid']

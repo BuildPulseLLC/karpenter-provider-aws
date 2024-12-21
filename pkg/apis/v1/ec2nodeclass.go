@@ -44,7 +44,10 @@ type EC2NodeClassSpec struct {
 	// +required
 	SecurityGroupSelectorTerms []SecurityGroupSelectorTerm `json:"securityGroupSelectorTerms" hash:"ignore"`
 	// AssociatePublicIPAddress controls if public IP addresses are assigned to instances that are launched with the nodeclass.
+	// WarmPool configures the use of a warm pool of stopped instances from an Auto Scaling group
 	// +optional
+	WarmPool *WarmPoolConfig `json:"warmPool,omitempty"`
+
 	AssociatePublicIPAddress *bool `json:"associatePublicIPAddress,omitempty"`
 	// AMISelectorTerms is a list of or ami selector terms. The terms are ORed.
 	// +kubebuilder:validation:XValidation:message="expected at least one, got none, ['tags', 'id', 'name', 'alias']",rule="self.all(x, has(x.tags) || has(x.id) || has(x.name) || has(x.alias))"
@@ -134,6 +137,21 @@ type EC2NodeClassSpec struct {
 	// https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateFleet.html
 	// +optional
 	Context *string `json:"context,omitempty"`
+}
+
+// WarmPoolConfig defines configuration for using a warm pool of stopped instances
+type WarmPoolConfig struct {
+	// AutoScalingGroupName is the name of the Auto Scaling group containing the warm pool.
+	// The ASG must be configured with a warm pool that maintains stopped instances.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self != ''",message="autoScalingGroupName cannot be empty"
+	AutoScalingGroupName string `json:"autoScalingGroupName"`
+
+	// MinSize is the minimum number of stopped instances to maintain in the warm pool.
+	// If not specified, the ASG's warm pool configuration will be used.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MinSize *int32 `json:"minSize,omitempty"`
 }
 
 // SubnetSelectorTerm defines selection logic for a subnet used by Karpenter to launch nodes.

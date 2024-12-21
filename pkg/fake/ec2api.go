@@ -56,6 +56,7 @@ type EC2Behavior struct {
 	DescribeSpotPriceHistoryInput       AtomicPtr[ec2.DescribeSpotPriceHistoryInput]
 	DescribeSpotPriceHistoryOutput      AtomicPtr[ec2.DescribeSpotPriceHistoryOutput]
 	CreateFleetBehavior                 MockedFunction[ec2.CreateFleetInput, ec2.CreateFleetOutput]
+	StartInstancesBehavior              MockedFunction[ec2.StartInstancesInput, ec2.StartInstancesOutput]
 	TerminateInstancesBehavior          MockedFunction[ec2.TerminateInstancesInput, ec2.TerminateInstancesOutput]
 	DescribeInstancesBehavior           MockedFunction[ec2.DescribeInstancesInput, ec2.DescribeInstancesOutput]
 	CreateTagsBehavior                  MockedFunction[ec2.CreateTagsInput, ec2.CreateTagsOutput]
@@ -90,6 +91,7 @@ func (e *EC2API) Reset() {
 	e.DescribeInstanceTypeOfferingsOutput.Reset()
 	e.DescribeAvailabilityZonesOutput.Reset()
 	e.CreateFleetBehavior.Reset()
+	e.StartInstancesBehavior.Reset()
 	e.TerminateInstancesBehavior.Reset()
 	e.DescribeInstancesBehavior.Reset()
 	e.CalledWithCreateLaunchTemplateInput.Reset()
@@ -106,6 +108,36 @@ func (e *EC2API) Reset() {
 	})
 	e.InsufficientCapacityPools.Reset()
 	e.NextError.Reset()
+}
+
+func (e *EC2API) StartInstances(_ context.Context, input *ec2.StartInstancesInput, _ ...func(*ec2.Options)) (*ec2.StartInstancesOutput, error) {
+	return e.StartInstancesBehavior.Invoke(input, func(input *ec2.StartInstancesInput) (*ec2.StartInstancesOutput, error) {
+		if !e.NextError.IsNil() {
+			defer e.NextError.Reset()
+			return nil, e.NextError.Get()
+		}
+		var stateChanges []ec2types.InstanceStateChange
+		for _, id := range input.InstanceIds {
+			raw, ok := e.Instances.Load(id)
+			if !ok {
+				return nil, &smithy.GenericAPIError{
+					Code:    "InvalidInstanceID.NotFound",
+					Message: fmt.Sprintf("instance %s not found", id),
+				}
+			}
+			instance := raw.(ec2types.Instance)
+			instance.State.Name = ec2types.InstanceStateNameRunning
+			e.Instances.Store(id, instance)
+			stateChanges = append(stateChanges, ec2types.InstanceStateChange{
+				CurrentState:  &ec2types.InstanceState{Name: ec2types.InstanceStateNameRunning, Code: aws.Int32(16)},
+				InstanceId:    aws.String(id),
+				PreviousState: &ec2types.InstanceState{Name: ec2types.InstanceStateNameStopped, Code: aws.Int32(80)},
+			})
+		}
+		return &ec2.StartInstancesOutput{
+			StartingInstances: stateChanges,
+		}, nil
+	})
 }
 
 // nolint: gocyclo

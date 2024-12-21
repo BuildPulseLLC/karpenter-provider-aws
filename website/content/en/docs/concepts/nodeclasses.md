@@ -148,6 +148,57 @@ spec:
   # Optional, configures if the instance should be launched with an associated public IP address.
   # If not specified, the default value depends on the subnet's public IP auto-assign setting.
   associatePublicIPAddress: true
+
+  # Optional, configures the use of a warm pool of stopped instances from an Auto Scaling group
+  warmPool:
+    # Required, name of the Auto Scaling group containing the warm pool
+    autoScalingGroupName: my-asg-with-warm-pool
+    # Optional, minimum number of stopped instances to maintain in the warm pool
+    minSize: 2
+
+```
+
+## spec.warmPool
+
+The `warmPool` field allows Karpenter to use instances from an Auto Scaling group's warm pool before provisioning new instances. When enabled, Karpenter will:
+
+1. Check for available stopped instances in the specified ASG's warm pool
+2. If instances are available, start one and use it for the workload
+3. If no instances are available, fall back to standard provisioning
+
+This can help reduce node startup times by maintaining a pool of pre-initialized instances in a stopped state.
+
+```yaml
+spec:
+  warmPool:
+    # Required: Name of the Auto Scaling group containing the warm pool
+    autoScalingGroupName: my-asg-with-warm-pool
+    # Optional: Minimum number of stopped instances to maintain
+    minSize: 2
+```
+
+{{% alert title="Note" color="primary" %}}
+The Auto Scaling group must be configured with a warm pool that maintains stopped instances. See [AWS documentation](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html) for details on configuring warm pools.
+{{% /alert %}}
+
+The following IAM permissions are required to use warm pools:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:StartInstances",
+                "ec2:DescribeInstances"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
 status:
   # Resolved subnets
   subnets:

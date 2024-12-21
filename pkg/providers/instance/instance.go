@@ -70,6 +70,8 @@ var (
 
 type Provider interface {
 	Create(context.Context, *v1.EC2NodeClass, *karpv1.NodeClaim, map[string]string, []*cloudprovider.InstanceType) (*Instance, error)
+	GetWarmPoolInstance(context.Context, *v1.EC2NodeClass) (*Instance, error)
+	StartInstance(context.Context, string) error
 	Get(context.Context, string) (*Instance, error)
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
@@ -97,6 +99,59 @@ func NewDefaultProvider(ctx context.Context, region string, ec2api sdk.EC2API, u
 	}
 }
 
+func (p *DefaultProvider) GetWarmPoolInstance(ctx context.Context, nodeClass *v1.EC2NodeClass) (*Instance, error) {
+	if nodeClass.Spec.WarmPool == nil {
+		return nil, nil
+	}
+
+	out, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("instance-state-name"),
+				Values: []string{string(ec2types.InstanceStateNameStopped)},
+			},
+			{
+				Name:   aws.String("tag:aws:autoscaling:groupName"),
+				Values: []string{nodeClass.Spec.WarmPool.AutoScalingGroupName},
+			},
+			{
+				Name:   aws.String("tag:aws:autoscaling:warmPool"),
+				Values: []string{"true"},
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("describing warm pool instances, %w", err)
+	}
+
+	instances, err := instancesFromOutput(out)
+	if err != nil || len(instances) == 0 {
+		return nil, nil
+	}
+	return instances[0], nil
+}
+
+func (p *DefaultProvider) StartInstance(ctx context.Context, instanceID string) error {
+	_, err := p.ec2api.StartInstances(ctx, &ec2.StartInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		if awserrors.IsNotFound(err) {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("starting instance %s, %w", instanceID, err))
+		}
+		return fmt.Errorf("starting instance %s, %w", instanceID, err)
+	}
+
+	// Wait for instance to be running
+	waiter := ec2.NewInstanceRunningWaiter(p.ec2api)
+	if err := waiter.Wait(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceID},
+	}, 5*time.Minute); err != nil {
+		return fmt.Errorf("waiting for instance %s to start, %w", instanceID, err)
+	}
+	return nil
+}
+
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, tags map[string]string, instanceTypes []*cloudprovider.InstanceType) (*Instance, error) {
 	schedulingRequirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 	// Only filter the instances if there are no minValues in the requirement.
@@ -106,6 +161,20 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass
 	instanceTypes, err := cloudprovider.InstanceTypes(instanceTypes).Truncate(schedulingRequirements, maxInstanceTypes)
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("truncating instance types, %w", err), "Error truncating instance types based on the passed-in requirements")
+	}
+
+	// Check warm pool first if configured
+	if nodeClass.Spec.WarmPool != nil {
+		instance, err := p.GetWarmPoolInstance(ctx, nodeClass)
+		if err != nil {
+			return nil, cloudprovider.NewCreateError(fmt.Errorf("checking warm pool, %w", err), "Error checking warm pool")
+		}
+		if instance != nil {
+			if err := p.StartInstance(ctx, instance.ID); err != nil {
+				return nil, cloudprovider.NewCreateError(fmt.Errorf("starting warm pool instance, %w", err), "Error starting warm pool instance")
+			}
+			return instance, nil
+		}
 	}
 	fleetInstance, err := p.launchInstance(ctx, nodeClass, nodeClaim, instanceTypes, tags)
 	if awserrors.IsLaunchTemplateNotFound(err) {
