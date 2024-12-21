@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/middleware"
 	config "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -115,6 +116,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	}
 	ec2api := ec2.NewFromConfig(cfg)
 	eksapi := eks.NewFromConfig(cfg)
+	autoscalingapi := autoscaling.NewFromConfig(cfg)
 	log.FromContext(ctx).WithValues("region", cfg.Region).V(1).Info("discovered region")
 	if err := CheckEC2Connectivity(ctx, ec2api); err != nil {
 		log.FromContext(ctx).Error(err, "ec2 api connectivity check failed")
@@ -180,9 +182,11 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		ctx,
 		cfg.Region,
 		ec2api,
+		autoscalingapi,
 		unavailableOfferingsCache,
 		subnetProvider,
 		launchTemplateProvider,
+		kubeClient,
 	)
 
 	return ctx, &Operator{

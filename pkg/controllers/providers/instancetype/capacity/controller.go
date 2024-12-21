@@ -17,6 +17,8 @@ package capacity
 import (
 	"context"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"time"
 
 	"github.com/awslabs/operatorpkg/reasonable"
 	corev1 "k8s.io/api/core/v1"
@@ -58,6 +60,10 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	}
 	nodeClaim, err := nodeutils.NodeClaimForNode(ctx, c.kubeClient, node)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{RequeueAfter: time.Second * 5}, nil
+		}
+
 		return reconcile.Result{}, fmt.Errorf("failed to get nodeclaim for node, %w", err)
 	}
 

@@ -127,10 +127,11 @@ licenses: download ## Verifies dependency licenses
 	! go-licenses csv ./... | grep -v -e 'MIT' -e 'Apache-2.0' -e 'BSD-3-Clause' -e 'BSD-2-Clause' -e 'ISC' -e 'MPL-2.0' -e 'github.com/awslabs/amazon-eks-ami/nodeadm'
 
 image: ## Build the Karpenter controller images using ko build
-	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KOCACHE=$(KOCACHE) KO_DOCKER_REPO="$(KO_DOCKER_REPO)" ko build --bare github.com/aws/karpenter-provider-aws/cmd/controller))
+	$(eval CONTROLLER_IMG=$(shell $(WITH_GOFLAGS) KOCACHE=$(KOCACHE) KO_DOCKER_REPO="ko.local" ko build --local github.com/aws/karpenter-provider-aws/cmd/controller))
 	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
 	$(eval IMG_TAG=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 2 -s))
 	$(eval IMG_DIGEST=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 2))
+	docker tag $(shell echo $(CONTROLLER_IMG)) 796224758921.dkr.ecr.us-east-1.amazonaws.com/buildpulse.io/karpenter:0.0.1
 
 apply: verify image ## Deploy the controller from the current state of your git repository into your ~/.kube/config cluster
 	kubectl apply -f ./pkg/apis/crds/

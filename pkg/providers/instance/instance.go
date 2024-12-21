@@ -21,17 +21,20 @@ import (
 	"math"
 	"sort"
 	"strings"
-
-	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -70,6 +73,7 @@ var (
 
 type Provider interface {
 	Create(context.Context, *v1.EC2NodeClass, *karpv1.NodeClaim, map[string]string, []*cloudprovider.InstanceType) (*Instance, error)
+	StartInstance(context.Context, string) error
 	Get(context.Context, string) (*Instance, error)
 	List(context.Context) ([]*Instance, error)
 	Delete(context.Context, string) error
@@ -78,23 +82,200 @@ type Provider interface {
 
 type DefaultProvider struct {
 	region                 string
-	ec2api                 sdk.EC2API
+	ec2api                 *ec2.Client
+	autoscalingapi         *autoscaling.Client
 	unavailableOfferings   *cache.UnavailableOfferings
 	subnetProvider         subnet.Provider
 	launchTemplateProvider launchtemplate.Provider
 	ec2Batcher             *batcher.EC2API
+	kubeClient             client.Client
+	warmPoolMutex          sync.Mutex
 }
 
-func NewDefaultProvider(ctx context.Context, region string, ec2api sdk.EC2API, unavailableOfferings *cache.UnavailableOfferings,
-	subnetProvider subnet.Provider, launchTemplateProvider launchtemplate.Provider) *DefaultProvider {
+func NewDefaultProvider(ctx context.Context, region string, ec2api *ec2.Client, autoscalingapi *autoscaling.Client, unavailableOfferings *cache.UnavailableOfferings,
+	subnetProvider subnet.Provider, launchTemplateProvider launchtemplate.Provider, kubeClient client.Client) *DefaultProvider {
 	return &DefaultProvider{
 		region:                 region,
 		ec2api:                 ec2api,
+		autoscalingapi:         autoscalingapi,
 		unavailableOfferings:   unavailableOfferings,
 		subnetProvider:         subnetProvider,
 		launchTemplateProvider: launchTemplateProvider,
 		ec2Batcher:             batcher.EC2(ctx, ec2api),
+		kubeClient:             kubeClient,
 	}
+}
+
+func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, capacityType string, tags map[string]string) (ec2types.Instance, error) {
+	// Get ASG tags from launch template
+	runnerTypeLabelKey := "bp-runner-type"
+	runnerTypeTagKey := "eks:nodegroup-name"
+	runnerTypeValue, ok := nodeClaim.Labels[runnerTypeLabelKey]
+	if !ok {
+		return ec2types.Instance{}, fmt.Errorf("BPL: No nodeclaim labels found for runner type '%s'", runnerTypeLabelKey)
+	}
+	runnerTypeValue = fmt.Sprintf("eks-nodegroup-%s", runnerTypeValue)
+
+	clusterNameLabelKey := "eks-cluster-name"
+	clusterNameTagKey := "eks:cluster-name"
+	clusterNameValue, ok := nodeClaim.Labels[clusterNameLabelKey]
+	if !ok {
+		return ec2types.Instance{}, fmt.Errorf("BPL: No nodeclaim labels found for cluster name '%s'", runnerTypeLabelKey)
+	}
+
+	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Finding warm pool instance for runner type '%s'", runnerTypeValue))
+
+	if len(runnerTypeValue) == 0 || len(clusterNameValue) == 0 {
+		return ec2types.Instance{}, fmt.Errorf("BPL: No nodeclaim runner-type labels value found for runner type '%s' and cluster '%s'", runnerTypeLabelKey, clusterNameLabelKey)
+	}
+
+	p.warmPoolMutex.Lock() // only want 1 worker to match with instance
+
+	// describe ec2 instances
+	describeInstancesResp, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String(fmt.Sprintf("tag:%s", clusterNameTagKey)),
+				Values: []string{clusterNameValue},
+			},
+			{
+				Name:   aws.String(fmt.Sprintf("tag:%s", runnerTypeTagKey)),
+				Values: []string{runnerTypeValue},
+			},
+		},
+	})
+
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: failed to describe instances: %v", err)
+	}
+
+	if len(describeInstancesResp.Reservations) == 0 || len(describeInstancesResp.Reservations[0].Instances) == 0 {
+		return ec2types.Instance{}, fmt.Errorf("BPL: No instances found for runner type '%s:%s' cluster: '%s:%s',", runnerTypeTagKey, runnerTypeValue, clusterNameTagKey, clusterNameValue)
+	}
+
+	// Get all existing instances and nodeclaims to check for usage
+	nodeClaimList := &karpv1.NodeClaimList{}
+	if err := p.kubeClient.List(ctx, nodeClaimList); err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error listing existing nodeclaims: %w", err)
+	}
+
+	var originalNodeClaim *karpv1.NodeClaim
+	existingInstanceIDs := sets.New[string]()
+	for _, nc := range nodeClaimList.Items {
+		if nc.Status.ProviderID != "" {
+			if id, err := utils.ParseInstanceID(nc.Status.ProviderID); err == nil {
+				existingInstanceIDs.Insert(id)
+			}
+		}
+
+		if nc.Name == nodeClaim.Name {
+			originalNodeClaim = &nc
+		}
+	}
+
+	// Look for stopped instances in warm pool
+	for _, reservation := range describeInstancesResp.Reservations {
+		for _, instance := range reservation.Instances {
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Checking instance: '%s'", *instance.InstanceId))
+
+			// Skip if instance is already in use by another NodeClaim or if zone is unavailable (insufficient capacity)
+			foundInCache := p.unavailableOfferings.IsUnavailable(ec2types.InstanceType(instance.InstanceType), *instance.Placement.AvailabilityZone, string(capacityType))
+			foundInClaims := existingInstanceIDs.Has(*instance.InstanceId)
+			if foundInCache || foundInClaims {
+				continue
+			}
+
+			if *instance.State.Code == 80 { // stopped
+				err := p.StartInstance(ctx, *instance.InstanceId)
+				var apiErr smithy.APIError
+				if err != nil {
+					if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
+						fleetErr := ec2types.CreateFleetError{
+							LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
+								Overrides: &ec2types.FleetLaunchTemplateOverrides{
+									InstanceType:     ec2types.InstanceType(instance.InstanceType),
+									AvailabilityZone: instance.Placement.AvailabilityZone,
+								},
+							},
+							ErrorCode:    aws.String(apiErr.ErrorCode()),
+							ErrorMessage: aws.String(apiErr.ErrorMessage()),
+						}
+						p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
+					}
+
+					continue
+				}
+
+				// Update NodeClaim with instance ID immediately after successful start
+				if originalNodeClaim == nil {
+					if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, originalNodeClaim); err != nil {
+						return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching original nodeclass: '%s'", nodeClaim.Name)
+					}
+				}
+				patch := client.MergeFrom(originalNodeClaim.DeepCopy())
+				originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
+				if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
+					return ec2types.Instance{}, fmt.Errorf("failed to update NodeClaim with provider ID: %w", err)
+				}
+
+				p.warmPoolMutex.Unlock()
+
+				// Get instance details
+				describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+					InstanceIds: []string{*instance.InstanceId},
+				})
+
+				if err != nil {
+					return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
+				}
+
+				err = p.CreateTags(ctx, *instance.InstanceId, tags)
+				if err != nil {
+					return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
+				}
+
+				// Update inflight IPs tracking
+				p.subnetProvider.UpdateInflightIPs(
+					&ec2.CreateFleetInput{}, // empty fleet input since we're not using fleet
+					&ec2.CreateFleetOutput{
+						Instances: []ec2types.CreateFleetInstance{
+							{
+								InstanceIds: []string{*instance.InstanceId},
+								LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
+									Overrides: &ec2types.FleetLaunchTemplateOverrides{
+										SubnetId: describeResult.Reservations[0].Instances[0].SubnetId,
+									},
+								},
+							},
+						},
+					},
+					nil, // instance types not needed for warm pool
+					nil, // subnets not needed for warm pool
+					"",  // capacity type not needed for warm pool
+				)
+
+				log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
+
+				return describeResult.Reservations[0].Instances[0], nil
+			}
+		}
+	}
+
+	return ec2types.Instance{}, fmt.Errorf("BPL: No instances available")
+}
+
+func (p *DefaultProvider) StartInstance(ctx context.Context, instanceID string) error {
+	_, err := p.ec2api.StartInstances(ctx, &ec2.StartInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	if err != nil {
+		if awserrors.IsNotFound(err) {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("starting instance %s, %w", instanceID, err))
+		}
+		return fmt.Errorf("starting instance %s, %w", instanceID, err)
+	}
+
+	return nil
 }
 
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, tags map[string]string, instanceTypes []*cloudprovider.InstanceType) (*Instance, error) {
@@ -107,6 +288,16 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("truncating instance types, %w", err), "Error truncating instance types based on the passed-in requirements")
 	}
+
+	// Start warm pool instance if it exists
+	capacityType := p.getCapacityType(nodeClaim, instanceTypes)
+	instance, err := p.findAndStartWarmPoolInstance(ctx, nodeClaim, capacityType, tags)
+	if err != nil || instance.InstanceId == nil || len(*instance.InstanceId) == 0 {
+		p.warmPoolMutex.Unlock() // release lock in case function fails
+	} else {
+		return NewInstance(instance), nil
+	}
+
 	fleetInstance, err := p.launchInstance(ctx, nodeClass, nodeClaim, instanceTypes, tags)
 	if awserrors.IsLaunchTemplateNotFound(err) {
 		// retry once if launch template is not found. This allows karpenter to generate a new LT if the
