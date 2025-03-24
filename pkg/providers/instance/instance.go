@@ -142,6 +142,10 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 				Name:   aws.String(fmt.Sprintf("tag:%s", runnerTypeTagKey)),
 				Values: []string{runnerTypeValue},
 			},
+			{
+				Name:   aws.String("instance-state-name"),
+				Values: []string{"stopped"},
+			},
 		},
 	})
 
