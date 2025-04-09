@@ -224,6 +224,17 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 
 				p.warmPoolMutex.Unlock()
 
+				autoscalingGroupName := fmt.Sprintf("%s-eks-nodegroup-%s", clusterNameValue, runnerTypeValue)
+				_, err = p.autoscalingapi.DetachInstances(ctx, &autoscaling.DetachInstancesInput{
+					AutoScalingGroupName:           aws.String(autoscalingGroupName),
+					InstanceIds:                    []string{*instance.InstanceId},
+					ShouldDecrementDesiredCapacity: aws.Bool(false),
+				})
+
+				if err != nil {
+					return ec2types.Instance{}, fmt.Errorf("BPL: Error detaching instance: '%s' from '%s' with error: %w", *instance.InstanceId, autoscalingGroupName, err)
+				}
+
 				// Get instance details
 				describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
 					InstanceIds: []string{*instance.InstanceId},
