@@ -157,6 +157,17 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		return ec2types.Instance{}, fmt.Errorf("BPL: No instances found for runner type '%s:%s' cluster: '%s:%s',", runnerTypeTagKey, runnerTypeValue, clusterNameTagKey, clusterNameValue)
 	}
 
+	// Collect all instances into a single list
+	var allInstances []ec2types.Instance
+	for _, reservation := range describeInstancesResp.Reservations {
+		allInstances = append(allInstances, reservation.Instances...)
+	}
+
+	// Sort all instances by LaunchTime from earliest to most recent
+	sort.Slice(allInstances, func(i, j int) bool {
+		return allInstances[i].LaunchTime.Before(*allInstances[j].LaunchTime)
+	})
+
 	// Get all existing instances and nodeclaims to check for usage
 	nodeClaimList := &karpv1.NodeClaimList{}
 	if err := p.kubeClient.List(ctx, nodeClaimList); err != nil {
@@ -178,90 +189,88 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	}
 
 	// Look for stopped instances in warm pool
-	for _, reservation := range describeInstancesResp.Reservations {
-		for _, instance := range reservation.Instances {
-			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Checking instance: '%s'", *instance.InstanceId))
+	for _, instance := range allInstances {
+		log.FromContext(ctx).Info(fmt.Sprintf("BPL: Checking instance: '%s'", *instance.InstanceId))
 
-			// Skip if instance is already in use by another NodeClaim or if zone is unavailable (insufficient capacity)
-			foundInCache := p.unavailableOfferings.IsUnavailable(ec2types.InstanceType(instance.InstanceType), *instance.Placement.AvailabilityZone, string(capacityType))
-			foundInClaims := existingInstanceIDs.Has(*instance.InstanceId)
-			if foundInCache || foundInClaims {
+		// Skip if instance is already in use by another NodeClaim or if zone is unavailable (insufficient capacity)
+		foundInCache := p.unavailableOfferings.IsUnavailable(ec2types.InstanceType(instance.InstanceType), *instance.Placement.AvailabilityZone, string(capacityType))
+		foundInClaims := existingInstanceIDs.Has(*instance.InstanceId)
+		if foundInCache || foundInClaims {
+			continue
+		}
+
+		if *instance.State.Code == 80 { // stopped
+			err := p.StartInstance(ctx, *instance.InstanceId)
+			var apiErr smithy.APIError
+			if err != nil {
+				if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
+					fleetErr := ec2types.CreateFleetError{
+						LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
+							Overrides: &ec2types.FleetLaunchTemplateOverrides{
+								InstanceType:     ec2types.InstanceType(instance.InstanceType),
+								AvailabilityZone: instance.Placement.AvailabilityZone,
+							},
+						},
+						ErrorCode:    aws.String(apiErr.ErrorCode()),
+						ErrorMessage: aws.String(apiErr.ErrorMessage()),
+					}
+					p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
+				}
+
 				continue
 			}
 
-			if *instance.State.Code == 80 { // stopped
-				err := p.StartInstance(ctx, *instance.InstanceId)
-				var apiErr smithy.APIError
-				if err != nil {
-					if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
-						fleetErr := ec2types.CreateFleetError{
+			// Update NodeClaim with instance ID immediately after successful start
+			if originalNodeClaim == nil {
+				if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, originalNodeClaim); err != nil {
+					return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching original nodeclass: '%s'", nodeClaim.Name)
+				}
+			}
+			patch := client.MergeFrom(originalNodeClaim.DeepCopy())
+			originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
+			if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
+				return ec2types.Instance{}, fmt.Errorf("failed to update NodeClaim with provider ID: %w", err)
+			}
+
+			p.warmPoolMutex.Unlock()
+
+			// Get instance details
+			describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+				InstanceIds: []string{*instance.InstanceId},
+			})
+
+			if err != nil {
+				return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
+			}
+
+			err = p.CreateTags(ctx, *instance.InstanceId, tags)
+			if err != nil {
+				return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
+			}
+
+			// Update inflight IPs tracking
+			p.subnetProvider.UpdateInflightIPs(
+				&ec2.CreateFleetInput{}, // empty fleet input since we're not using fleet
+				&ec2.CreateFleetOutput{
+					Instances: []ec2types.CreateFleetInstance{
+						{
+							InstanceIds: []string{*instance.InstanceId},
 							LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
 								Overrides: &ec2types.FleetLaunchTemplateOverrides{
-									InstanceType:     ec2types.InstanceType(instance.InstanceType),
-									AvailabilityZone: instance.Placement.AvailabilityZone,
-								},
-							},
-							ErrorCode:    aws.String(apiErr.ErrorCode()),
-							ErrorMessage: aws.String(apiErr.ErrorMessage()),
-						}
-						p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
-					}
-
-					continue
-				}
-
-				// Update NodeClaim with instance ID immediately after successful start
-				if originalNodeClaim == nil {
-					if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, originalNodeClaim); err != nil {
-						return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching original nodeclass: '%s'", nodeClaim.Name)
-					}
-				}
-				patch := client.MergeFrom(originalNodeClaim.DeepCopy())
-				originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
-				if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
-					return ec2types.Instance{}, fmt.Errorf("failed to update NodeClaim with provider ID: %w", err)
-				}
-
-				p.warmPoolMutex.Unlock()
-
-				// Get instance details
-				describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-					InstanceIds: []string{*instance.InstanceId},
-				})
-
-				if err != nil {
-					return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
-				}
-
-				err = p.CreateTags(ctx, *instance.InstanceId, tags)
-				if err != nil {
-					return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
-				}
-
-				// Update inflight IPs tracking
-				p.subnetProvider.UpdateInflightIPs(
-					&ec2.CreateFleetInput{}, // empty fleet input since we're not using fleet
-					&ec2.CreateFleetOutput{
-						Instances: []ec2types.CreateFleetInstance{
-							{
-								InstanceIds: []string{*instance.InstanceId},
-								LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
-									Overrides: &ec2types.FleetLaunchTemplateOverrides{
-										SubnetId: describeResult.Reservations[0].Instances[0].SubnetId,
-									},
+									SubnetId: describeResult.Reservations[0].Instances[0].SubnetId,
 								},
 							},
 						},
 					},
-					nil, // instance types not needed for warm pool
-					nil, // subnets not needed for warm pool
-					"",  // capacity type not needed for warm pool
-				)
+				},
+				nil, // instance types not needed for warm pool
+				nil, // subnets not needed for warm pool
+				"",  // capacity type not needed for warm pool
+			)
 
-				log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
 
-				return describeResult.Reservations[0].Instances[0], nil
-			}
+			return describeResult.Reservations[0].Instances[0], nil
 		}
 	}
 
