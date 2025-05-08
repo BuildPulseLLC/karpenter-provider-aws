@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -110,11 +111,11 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	// Get ASG tags from launch template
 	runnerTypeLabelKey := "bp-runner-type"
 	runnerTypeTagKey := "eks:nodegroup-name"
-	runnerTypeValue, ok := nodeClaim.Labels[runnerTypeLabelKey]
+	runnerTypeRawValue, ok := nodeClaim.Labels[runnerTypeLabelKey]
 	if !ok {
 		return ec2types.Instance{}, fmt.Errorf("BPL: No nodeclaim labels found for runner type '%s'", runnerTypeLabelKey)
 	}
-	runnerTypeValue = fmt.Sprintf("eks-nodegroup-%s", runnerTypeValue)
+	runnerTypeValue := fmt.Sprintf("eks-nodegroup-%s", runnerTypeRawValue)
 
 	clusterNameLabelKey := "eks-cluster-name"
 	clusterNameTagKey := "eks:cluster-name"
@@ -128,8 +129,6 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	if len(runnerTypeValue) == 0 || len(clusterNameValue) == 0 {
 		return ec2types.Instance{}, fmt.Errorf("BPL: No nodeclaim runner-type labels value found for runner type '%s' and cluster '%s'", runnerTypeLabelKey, clusterNameLabelKey)
 	}
-
-	p.warmPoolMutex.Lock() // only want 1 worker to match with instance
 
 	// describe ec2 instances
 	describeInstancesResp, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
@@ -168,9 +167,12 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		return allInstances[i].LaunchTime.Before(*allInstances[j].LaunchTime)
 	})
 
+	p.warmPoolMutex.Lock() // only want 1 worker to match with instance
+
 	// Get all existing instances and nodeclaims to check for usage
 	nodeClaimList := &karpv1.NodeClaimList{}
 	if err := p.kubeClient.List(ctx, nodeClaimList); err != nil {
+		p.warmPoolMutex.Unlock()
 		return ec2types.Instance{}, fmt.Errorf("BPL: Error listing existing nodeclaims: %w", err)
 	}
 
@@ -188,107 +190,155 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		}
 	}
 
-	// Look for stopped instances in warm pool
-	for _, instance := range allInstances {
-		log.FromContext(ctx).Info(fmt.Sprintf("BPL: Checking instance: '%s'", *instance.InstanceId))
-
+	var instance ec2types.Instance
+	for _, instance_cur := range allInstances {
+		if instance_cur.InstanceId == nil {
+			continue
+		}
 		// Skip if instance is already in use by another NodeClaim or if zone is unavailable (insufficient capacity)
-		foundInCache := p.unavailableOfferings.IsUnavailable(ec2types.InstanceType(instance.InstanceType), *instance.Placement.AvailabilityZone, string(capacityType))
-		foundInClaims := existingInstanceIDs.Has(*instance.InstanceId)
+		foundInCache := p.unavailableOfferings.IsUnavailable(ec2types.InstanceType(instance_cur.InstanceType), *instance_cur.Placement.AvailabilityZone, string(capacityType))
+		foundInClaims := existingInstanceIDs.Has(*instance_cur.InstanceId)
+
 		if foundInCache || foundInClaims {
 			continue
 		}
 
-		if *instance.State.Code == 80 { // stopped
-			err := p.StartInstance(ctx, *instance.InstanceId)
-			var apiErr smithy.APIError
-			if err != nil {
-				if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
-					fleetErr := ec2types.CreateFleetError{
-						LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
-							Overrides: &ec2types.FleetLaunchTemplateOverrides{
-								InstanceType:     ec2types.InstanceType(instance.InstanceType),
-								AvailabilityZone: instance.Placement.AvailabilityZone,
-							},
-						},
-						ErrorCode:    aws.String(apiErr.ErrorCode()),
-						ErrorMessage: aws.String(apiErr.ErrorMessage()),
-					}
-					p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
-				}
+		instance = instance_cur
+		break
+	}
 
-				continue
-			}
+	if instance.InstanceId == nil || len(*instance.InstanceId) == 0 { // instance not found
+		p.warmPoolMutex.Unlock()
+		return ec2types.Instance{}, fmt.Errorf("BPL: No instance available")
+	}
 
-			// Update NodeClaim with instance ID immediately after successful start
-			if originalNodeClaim == nil {
-				if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, originalNodeClaim); err != nil {
-					return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching original nodeclass: '%s'", nodeClaim.Name)
-				}
-			}
-			patch := client.MergeFrom(originalNodeClaim.DeepCopy())
-			originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
-			if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
-				return ec2types.Instance{}, fmt.Errorf("failed to update NodeClaim with provider ID: %w", err)
-			}
-
+	// Update NodeClaim with instance ID immediately after successful start
+	if originalNodeClaim == nil {
+		if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: nodeClaim.Name}, originalNodeClaim); err != nil {
 			p.warmPoolMutex.Unlock()
+			return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching original nodeclass: '%s'", nodeClaim.Name)
+		}
+	}
+	patch := client.MergeFrom(originalNodeClaim.DeepCopy())
 
-			// Get instance details
-			describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-				InstanceIds: []string{*instance.InstanceId},
-			})
+	// Add the requested labels
+	originalNodeClaim.Labels["karpenter.sh/nodepool"] = runnerTypeRawValue
+	originalNodeClaim.Labels["eks.amazonaws.com/capacityType"] = "ON_DEMAND"
+	originalNodeClaim.Labels["eks.amazonaws.com/nodegroup"] = runnerTypeValue
 
-			if err != nil {
-				return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
-			}
+	// Set the instance type label
+	originalNodeClaim.Labels[corev1.LabelInstanceTypeStable] = string(instance.InstanceType)
+	originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
+	originalNodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeLaunched)
+	if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
+		p.warmPoolMutex.Unlock()
+		return ec2types.Instance{}, fmt.Errorf("failed to update NodeClaim with provider ID: %w", err)
+	}
 
-			err = p.CreateTags(ctx, *instance.InstanceId, tags)
-			if err != nil {
-				return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
-			}
+	p.warmPoolMutex.Unlock()
 
-			// Update inflight IPs tracking
-			p.subnetProvider.UpdateInflightIPs(
-				&ec2.CreateFleetInput{}, // empty fleet input since we're not using fleet
-				&ec2.CreateFleetOutput{
-					Instances: []ec2types.CreateFleetInstance{
-						{
-							InstanceIds: []string{*instance.InstanceId},
-							LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
-								Overrides: &ec2types.FleetLaunchTemplateOverrides{
-									SubnetId: describeResult.Reservations[0].Instances[0].SubnetId,
-								},
-							},
+	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Using instance: '%s'", *instance.InstanceId))
+
+	err = p.StartInstance(ctx, *instance.InstanceId)
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error Starting warm pool instance '%s': %w", *instance.InstanceId, err)
+	}
+	err = p.CreateTags(ctx, *instance.InstanceId, tags)
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
+		fleetErr := ec2types.CreateFleetError{
+			LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
+				Overrides: &ec2types.FleetLaunchTemplateOverrides{
+					InstanceType:     ec2types.InstanceType(instance.InstanceType),
+					AvailabilityZone: instance.Placement.AvailabilityZone,
+				},
+			},
+			ErrorCode:    aws.String(apiErr.ErrorCode()),
+			ErrorMessage: aws.String(apiErr.ErrorMessage()),
+		}
+		p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
+	}
+
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Insufficient capacity in AZ")
+	}
+
+	// Get instance details
+	describeResult, err := p.ec2api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: []string{*instance.InstanceId},
+	})
+
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
+	}
+
+	// Update inflight IPs tracking
+	p.subnetProvider.UpdateInflightIPs(
+		&ec2.CreateFleetInput{}, // empty fleet input since we're not using fleet
+		&ec2.CreateFleetOutput{
+			Instances: []ec2types.CreateFleetInstance{
+				{
+					InstanceIds: []string{*instance.InstanceId},
+					LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
+						Overrides: &ec2types.FleetLaunchTemplateOverrides{
+							SubnetId: describeResult.Reservations[0].Instances[0].SubnetId,
 						},
 					},
 				},
-				nil, // instance types not needed for warm pool
-				nil, // subnets not needed for warm pool
-				"",  // capacity type not needed for warm pool
-			)
+			},
+		},
+		nil, // instance types not needed for warm pool
+		nil, // subnets not needed for warm pool
+		"",  // capacity type not needed for warm pool
+	)
 
-			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
+	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
 
-			return describeResult.Reservations[0].Instances[0], nil
-		}
-	}
-
-	return ec2types.Instance{}, fmt.Errorf("BPL: No instances available")
+	return describeResult.Reservations[0].Instances[0], nil
 }
 
 func (p *DefaultProvider) StartInstance(ctx context.Context, instanceID string) error {
-	_, err := p.ec2api.StartInstances(ctx, &ec2.StartInstancesInput{
-		InstanceIds: []string{instanceID},
-	})
-	if err != nil {
+	const (
+		maxRetries = 5
+		baseDelay  = 1 * time.Second
+	)
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		_, err := p.ec2api.StartInstances(ctx, &ec2.StartInstancesInput{
+			InstanceIds: []string{instanceID},
+		})
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
 		if awserrors.IsNotFound(err) {
 			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("starting instance %s, %w", instanceID, err))
 		}
-		return fmt.Errorf("starting instance %s, %w", instanceID, err)
+
+		// Check if it's a rate limit error
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "RequestLimitExceeded" {
+			// Calculate delay with exponential backoff
+			delay := baseDelay * time.Duration(2)
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Rate limit exceeded, retrying in %v (attempt %d/%d)", delay, attempt+1, maxRetries))
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled while waiting to retry: %w", lastErr)
+			case <-time.After(delay):
+				continue
+			}
+		}
+
+		// For other errors, return immediately
+		return fmt.Errorf("failed to start instance %s, %w", instanceID, err)
 	}
 
-	return nil
+	return fmt.Errorf("failed to start instance after %d attempts, last error: %w", maxRetries, lastErr)
 }
 
 func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass, nodeClaim *karpv1.NodeClaim, tags map[string]string, instanceTypes []*cloudprovider.InstanceType) (*Instance, error) {
@@ -305,10 +355,10 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass
 	// Start warm pool instance if it exists
 	capacityType := p.getCapacityType(nodeClaim, instanceTypes)
 	instance, err := p.findAndStartWarmPoolInstance(ctx, nodeClaim, capacityType, tags)
-	if err != nil || instance.InstanceId == nil || len(*instance.InstanceId) == 0 {
-		p.warmPoolMutex.Unlock() // release lock in case function fails
-	} else {
+	if err == nil && len(*instance.InstanceId) > 0 {
 		return NewInstance(instance), nil
+	} else if err != nil {
+		log.FromContext(ctx).Info(fmt.Sprintf("BPL: Error: '%w'", err))
 	}
 
 	fleetInstance, err := p.launchInstance(ctx, nodeClass, nodeClaim, instanceTypes, tags)
