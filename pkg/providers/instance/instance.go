@@ -295,6 +295,16 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		"",  // capacity type not needed for warm pool
 	)
 
+	// Detach instance from Auto Scaling Group if it's part of one
+	_, err = p.autoscalingapi.DetachInstances(ctx, &autoscaling.DetachInstancesInput{
+		AutoScalingGroupName:           aws.String(fmt.Sprintf("%s-%s", clusterNameValue, runnerTypeValue)),
+		InstanceIds:                    []string{*instance.InstanceId},
+		ShouldDecrementDesiredCapacity: aws.Bool(false),
+	})
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Could not detach instance from ASG: %w", err)
+	}
+
 	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
 
 	return describeResult.Reservations[0].Instances[0], nil

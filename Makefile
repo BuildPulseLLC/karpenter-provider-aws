@@ -131,7 +131,7 @@ image: ## Build the Karpenter controller images using ko build
 	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
 	$(eval IMG_TAG=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 2 -s))
 	$(eval IMG_DIGEST=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 2))
-	docker tag $(shell echo $(CONTROLLER_IMG)) 796224758921.dkr.ecr.us-east-1.amazonaws.com/buildpulse.io/karpenter:0.0.4-test
+	docker tag $(shell echo $(CONTROLLER_IMG)) 796224758921.dkr.ecr.us-east-1.amazonaws.com/buildpulse.io/karpenter:0.0.5-test
 
 apply: verify image ## Deploy the controller from the current state of your git repository into your ~/.kube/config cluster
 	kubectl apply -f ./pkg/apis/crds/
