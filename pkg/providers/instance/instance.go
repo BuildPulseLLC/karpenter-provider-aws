@@ -107,7 +107,7 @@ func NewDefaultProvider(ctx context.Context, region string, ec2api *ec2.Client, 
 	}
 }
 
-func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, capacityType string, tags map[string]string) (ec2types.Instance, error) {
+func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, capacityType string, tags map[string]string, nodeClass *v1.EC2NodeClass) (ec2types.Instance, error) {
 	// Get ASG tags from launch template
 	runnerTypeLabelKey := "bp-runner-type"
 	runnerTypeTagKey := "eks:nodegroup-name"
@@ -239,13 +239,66 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 
 	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Using instance: '%s'", *instance.InstanceId))
 
+	// Get volume size from nodeclass
+	var volumeSize int32 = 0 // default size
+	var deviceName string = ""
+	if nodeClass.Spec.BlockDeviceMappings != nil {
+		if secondaryVolume, ok := lo.Find(nodeClass.Spec.BlockDeviceMappings, func(bdm *v1.BlockDeviceMapping) bool {
+			return !bdm.RootVolume && *bdm.DeviceName != "/dev/xvda"
+		}); ok && secondaryVolume.EBS != nil && secondaryVolume.EBS.VolumeSize != nil {
+			volumeSize = int32(secondaryVolume.EBS.VolumeSize.Value() / (1024 * 1024 * 1024)) // Convert to GiB
+			deviceName = *secondaryVolume.DeviceName
+		}
+	}
+
+	var volume *ec2types.Volume
+	if volumeSize > 0 {
+		volume, err := p.ec2api.CreateVolume(ctx, &ec2.CreateVolumeInput{
+			AvailabilityZone: instance.Placement.AvailabilityZone,
+			Size:             aws.Int32(volumeSize),
+			VolumeType:       ec2types.VolumeTypeGp3,
+			TagSpecifications: []ec2types.TagSpecification{
+				{
+					ResourceType: ec2types.ResourceTypeVolume,
+					Tags: []ec2types.Tag{
+						{Key: aws.String("eks:cluster-name"), Value: aws.String(clusterNameValue)},
+					},
+				},
+			},
+		})
+		if err != nil {
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Error creating volume: %v", err))
+		}
+
+		availableWaiter := ec2.NewVolumeAvailableWaiter(p.ec2api, func(o *ec2.VolumeAvailableWaiterOptions) {
+			o.MinDelay = 250 * time.Millisecond
+			o.MaxDelay = 250 * time.Millisecond
+		})
+		err = availableWaiter.Wait(ctx, &ec2.DescribeVolumesInput{
+			VolumeIds: []string{*volume.VolumeId},
+		}, 20*time.Second)
+		if err != nil {
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Error waiting for volume to be available: %v\n", err))
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
+		log.FromContext(ctx).Info(fmt.Sprintf("BPL: Created volume with ID: %s\n", *volume.VolumeId))
+
+		_, err = p.ec2api.AttachVolume(ctx, &ec2.AttachVolumeInput{
+			Device:     aws.String(deviceName),
+			InstanceId: instance.InstanceId,
+			VolumeId:   volume.VolumeId,
+		})
+		if err != nil { // delete if a volume is already attached
+			log.FromContext(ctx).Info(fmt.Sprintf("BPL: Error attaching volume to instance %s: %v", *instance.InstanceId, err))
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
+	}
+
 	err = p.StartInstance(ctx, *instance.InstanceId)
 	if err != nil {
-		return ec2types.Instance{}, fmt.Errorf("BPL: Error Starting warm pool instance '%s': %w", *instance.InstanceId, err)
-	}
-	err = p.CreateTags(ctx, *instance.InstanceId, tags)
-	if err != nil {
-		return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
+		if volume != nil {
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "InsufficientInstanceCapacity" {
@@ -261,9 +314,19 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		}
 		p.unavailableOfferings.MarkUnavailableForFleetErr(ctx, fleetErr, capacityType)
 	}
-
 	if err != nil {
-		return ec2types.Instance{}, fmt.Errorf("BPL: Insufficient capacity in AZ")
+		if volume != nil {
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error Starting warm pool instance '%s': %w", *instance.InstanceId, err)
+	}
+
+	err = p.CreateTags(ctx, *instance.InstanceId, tags)
+	if err != nil {
+		if volume != nil {
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error tagging warm pool instance '%s': %w", *instance.InstanceId, err)
 	}
 
 	// Get instance details
@@ -272,6 +335,9 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	})
 
 	if err != nil {
+		if volume != nil {
+			p.deleteVolume(ctx, volume.VolumeId)
+		}
 		return ec2types.Instance{}, fmt.Errorf("BPL: Error describing instance: '%s' with error: %w", *instance.InstanceId, err)
 	}
 
@@ -302,12 +368,39 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		ShouldDecrementDesiredCapacity: aws.Bool(false),
 	})
 	if err != nil {
+		p.deleteVolume(ctx, volume.VolumeId)
 		return ec2types.Instance{}, fmt.Errorf("BPL: Could not detach instance from ASG: %w", err)
+	}
+
+	if volumeSize > 0 {
+		_, err = p.ec2api.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+			InstanceId: instance.InstanceId,
+			BlockDeviceMappings: []ec2types.InstanceBlockDeviceMappingSpecification{
+				{
+					DeviceName: aws.String(deviceName),
+					Ebs: &ec2types.EbsInstanceBlockDeviceSpecification{
+						DeleteOnTermination: aws.Bool(true),
+					},
+				},
+			},
+		})
+		if err != nil {
+			fmt.Printf("Error modifying instance attribute: %v\n", err)
+		}
 	}
 
 	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Instance started: '%s'", *instance.InstanceId))
 
 	return describeResult.Reservations[0].Instances[0], nil
+}
+
+func (p *DefaultProvider) deleteVolume(ctx context.Context, volumeID *string) {
+	_, err := p.ec2api.DeleteVolume(ctx, &ec2.DeleteVolumeInput{
+		VolumeId: volumeID,
+	})
+	if err != nil {
+		log.FromContext(ctx).Info(fmt.Sprintf("BPL: Error deleting volume: %w", err))
+	}
 }
 
 func (p *DefaultProvider) StartInstance(ctx context.Context, instanceID string) error {
@@ -364,7 +457,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1.EC2NodeClass
 
 	// Start warm pool instance if it exists
 	capacityType := p.getCapacityType(nodeClaim, instanceTypes)
-	instance, err := p.findAndStartWarmPoolInstance(ctx, nodeClaim, capacityType, tags)
+	instance, err := p.findAndStartWarmPoolInstance(ctx, nodeClaim, capacityType, tags, nodeClass)
 	if err == nil && len(*instance.InstanceId) > 0 {
 		return NewInstance(instance), nil
 	} else if err != nil {
