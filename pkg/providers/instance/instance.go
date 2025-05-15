@@ -139,7 +139,7 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 			},
 			{
 				Name:   aws.String(fmt.Sprintf("tag:%s", runnerTypeTagKey)),
-				Values: []string{runnerTypeValue},
+				Values: []string{runnerTypeValue}, // runnerTypeValue
 			},
 			{
 				Name:   aws.String("instance-state-name"),
@@ -166,6 +166,19 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	sort.Slice(allInstances, func(i, j int) bool {
 		return allInstances[i].LaunchTime.Before(*allInstances[j].LaunchTime)
 	})
+
+	// Get nodepool
+	nodePool := &karpv1.NodePool{}
+	if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: runnerTypeRawValue}, nodePool); err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error fetching nodepool: %w", err)
+	}
+
+	desiredInstanceType := ""
+	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodePool.Spec.Template.Spec.Requirements...)
+	instanceTypeReq := requirements.Get(corev1.LabelInstanceTypeStable)
+	if instanceTypeReq != nil && len(instanceTypeReq.Values()) > 0 {
+		desiredInstanceType = instanceTypeReq.Values()[0]
+	}
 
 	p.warmPoolMutex.Lock() // only want 1 worker to match with instance
 
@@ -227,7 +240,7 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	originalNodeClaim.Labels["eks.amazonaws.com/nodegroup"] = runnerTypeValue
 
 	// Set the instance type label
-	originalNodeClaim.Labels[corev1.LabelInstanceTypeStable] = string(instance.InstanceType)
+	originalNodeClaim.Labels[corev1.LabelInstanceTypeStable] = string(desiredInstanceType)
 	originalNodeClaim.Status.ProviderID = fmt.Sprintf("aws:///%s/%s", *instance.Placement.AvailabilityZone, *instance.InstanceId)
 	originalNodeClaim.StatusConditions().SetTrue(karpv1.ConditionTypeLaunched)
 	if err := p.kubeClient.Status().Patch(ctx, originalNodeClaim, patch); err != nil {
@@ -236,6 +249,23 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 	}
 
 	p.warmPoolMutex.Unlock()
+
+	// Get instance type from nodepool requirements
+	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Changing instance type from '%s' to '%s'", instance.InstanceType, desiredInstanceType))
+
+	// Modify instance type
+	_, err = p.ec2api.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId: instance.InstanceId,
+		InstanceType: &ec2types.AttributeValue{
+			Value: aws.String(desiredInstanceType),
+		},
+	})
+	if err != nil {
+		return ec2types.Instance{}, fmt.Errorf("BPL: Error modifying instance type: %w", err)
+	}
+
+	// Update instance type in our local instance object
+	instance.InstanceType = ec2types.InstanceType(desiredInstanceType)
 
 	log.FromContext(ctx).Info(fmt.Sprintf("BPL: Using instance: '%s'", *instance.InstanceId))
 
@@ -305,7 +335,7 @@ func (p *DefaultProvider) findAndStartWarmPoolInstance(ctx context.Context, node
 		fleetErr := ec2types.CreateFleetError{
 			LaunchTemplateAndOverrides: &ec2types.LaunchTemplateAndOverridesResponse{
 				Overrides: &ec2types.FleetLaunchTemplateOverrides{
-					InstanceType:     ec2types.InstanceType(instance.InstanceType),
+					InstanceType:     ec2types.InstanceType(desiredInstanceType),
 					AvailabilityZone: instance.Placement.AvailabilityZone,
 				},
 			},
