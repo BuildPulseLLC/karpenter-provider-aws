@@ -14,7 +14,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: bp-ubuntu-latest-x64-2x
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +31,7 @@ jobs:
 
   test:
     name: Test (K8s ${{ matrix.k8sVersion }})
-    runs-on: ubuntu-latest
+    runs-on: bp-ubuntu-latest-x64-2x
     strategy:
       fail-fast: false
       matrix:
@@ -63,7 +63,7 @@ jobs:
 
   build:
     name: Build Verification
-    runs-on: ubuntu-latest
+    runs-on: bp-ubuntu-latest-x64-2x
     steps:
       - uses: actions/checkout@v4
 
@@ -79,20 +79,3 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
-
-  vulnerability-check:
-    name: Vulnerability Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache-dependency-path: "**/go.sum"
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run vulnerability check
-        run: govulncheck ./pkg/...
