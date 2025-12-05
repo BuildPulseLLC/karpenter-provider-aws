@@ -19,7 +19,8 @@ env:
 jobs:
   build-and-push:
     name: Build and Push
-    runs-on: bp-ubuntu-latest-x64-2x
+    # runs-on: bp-ubuntu-latest-x64-2x
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
