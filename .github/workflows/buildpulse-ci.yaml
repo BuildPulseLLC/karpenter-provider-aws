@@ -42,23 +42,9 @@ jobs:
           VERSION="${GITHUB_REF_NAME#release/}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Check if tag exists
-        id: check_tag
-        run: |
-          if git ls-remote --tags origin | grep -q "refs/tags/${{ steps.version.outputs.version }}$"; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create and push tag
-        if: steps.check_tag.outputs.exists == 'false'
+      - name: Create and push tag (force if exists)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag ${{ steps.version.outputs.version }}
-          git push origin ${{ steps.version.outputs.version }}
-
-      - name: Skip - tag already exists
-        if: steps.check_tag.outputs.exists == 'true'
-        run: echo "Tag ${{ steps.version.outputs.version }} already exists, skipping"
+          git tag -f ${{ steps.version.outputs.version }}
+          git push origin ${{ steps.version.outputs.version }} --force
