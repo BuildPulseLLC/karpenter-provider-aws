@@ -17,17 +17,14 @@ charts/karpenter/                 # Helm chart (we use local chart in buildpulse
 | Branch | Purpose |
 |--------|---------|
 | `main` | Synced with upstream, latest changes |
-| `v0.0.x` | Release branches with BuildPulse customizations |
+| `release/v0.0.x` | Release branches with BuildPulse customizations |
 
 ## CI/CD Pipeline
 
 ### Automatic Checks (on PR and push)
 
 The `buildpulse-ci.yaml` workflow runs:
-- **Lint** - golangci-lint
-- **Test** - Unit tests against K8s 1.30-1.34
 - **Build Verification** - Ensures binary compiles
-- **Vulnerability Check** - govulncheck
 
 ### Release Process
 
@@ -42,7 +39,7 @@ The `buildpulse-release.yaml` workflow triggers on version tags and:
 
 ```bash
 git checkout v0.0.7
-git checkout -b v0.0.8
+git checkout -b release/v0.0.8
 ```
 
 ### 2. Make your changes
@@ -57,15 +54,17 @@ Common changes include:
 ```bash
 git add .
 git commit -m "Release v0.0.8: <summary of changes>"
-git push origin v0.0.8
+git push origin release/v0.0.8
 ```
 
 ### 4. Create and push the tag (triggers release)
 
 ```bash
 git tag v0.0.8
-git push origin v0.0.8 --tags
+git push origin v0.0.8
 ```
+
+> **Note:** Use `release/v0.0.x` for branch names and `v0.0.x` for tags to avoid conflicts.
 
 ### 5. Deploy to cluster
 
