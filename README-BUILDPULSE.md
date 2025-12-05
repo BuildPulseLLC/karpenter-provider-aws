@@ -57,16 +57,12 @@ git commit -m "Release v0.0.8: <summary of changes>"
 git push origin release/v0.0.8
 ```
 
-### 4. Create and push the tag (triggers release)
+CI will automatically:
+1. Build and verify the binary
+2. If build passes, create and push tag `v0.0.8`
+3. Tag push triggers the release workflow (builds and pushes Docker image to ECR)
 
-```bash
-git tag v0.0.8
-git push origin v0.0.8
-```
-
-> **Note:** Use `release/v0.0.x` for branch names and `v0.0.x` for tags to avoid conflicts.
-
-### 5. Deploy to cluster
+### 4. Deploy to cluster
 
 After the release workflow completes, update the Helm values in `buildpulse.io` repo:
 

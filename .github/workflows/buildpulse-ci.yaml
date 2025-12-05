@@ -23,3 +23,42 @@ jobs:
 
       - name: Build binary
         run: go build -o karpenter ./cmd/controller
+
+  release:
+    name: Tag and Release
+    needs: build
+    if: github.ref_type == 'branch' && startsWith(github.ref_name, 'release/')
+    # runs-on: bp-ubuntu-latest-x64-2x
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from branch name
+        id: version
+        run: |
+          # release/v0.0.8 -> v0.0.8
+          VERSION="${GITHUB_REF_NAME#release/}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git ls-remote --tags origin | grep -q "refs/tags/${{ steps.version.outputs.version }}$"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.version.outputs.version }}
+          git push origin ${{ steps.version.outputs.version }}
+
+      - name: Skip - tag already exists
+        if: steps.check_tag.outputs.exists == 'true'
+        run: echo "Tag ${{ steps.version.outputs.version }} already exists, skipping"
